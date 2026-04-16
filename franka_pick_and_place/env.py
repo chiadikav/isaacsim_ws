@@ -12,7 +12,6 @@ from gymnasium import spaces
 # Isaac Sim 4.x API (isaacsim.core.* replaces omni.isaac.core.*)
 from isaacsim.core.api import World
 from isaacsim.core.api.objects import DynamicCuboid
-from isaacsim.core.api.objects.ground_plane import GroundPlane
 from isaacsim.core.prims import SingleArticulation
 from isaacsim.core.utils.stage import add_reference_to_stage
 from isaacsim.core.utils.types import ArticulationAction
@@ -45,7 +44,7 @@ class PickPlaceEnv(gym.Env):
     # Max gripper finger opening (metres)
     GRIPPER_MAX = 0.04
     # Settling steps after reset
-    SETTLE_STEPS = 100
+    SETTLE_STEPS = 20
     # Franka USD asset path (relative to Nucleus assets root)
     FRANKA_USD = "/Isaac/Robots/FrankaRobotics/FrankaPanda/franka.usd"
 
@@ -54,16 +53,17 @@ class PickPlaceEnv(gym.Env):
 
         self.max_episode_steps = max_episode_steps
         self.step_count = 0
-        self.max_action_step = 0.05
+        self.max_action_step = 0.02  # smaller steps → less overshoot
         self._idx = env_index       # unique per env instance
         self._render = render       # True when viewport is open
 
         self.world = World(stage_units_in_meters=1.0, backend="numpy")
 
+        self._scene_loaded = False
         self._load_scene()
 
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(31,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(34,), dtype=np.float32
         )
         self.action_space = spaces.Box(
             low=-1.0, high=1.0, shape=(8,), dtype=np.float32
@@ -77,7 +77,10 @@ class PickPlaceEnv(gym.Env):
     ENV_SPACING = 2.0
 
     def _load_scene(self):
-        """Load Franka robot and target block into the world."""
+        """Load Franka robot and target block into the world (first call only)."""
+        if self._scene_loaded:
+            return
+        self._scene_loaded = True
         assets_root = get_assets_root_path()
         if assets_root is None:
             raise RuntimeError(
@@ -91,17 +94,17 @@ class PickPlaceEnv(gym.Env):
         franka_name = f"franka_{self._idx}"
         block_name  = f"target_block_{self._idx}"
 
-        # Offset each env along the Y axis so they don't overlap
-        self._origin = np.array([0.0, self._idx * self.ENV_SPACING, 0.0])
+        # Arrange envs in a grid: 5 columns along Y, rows along X
+        _row = self._idx // 5
+        _col = self._idx % 5
+        self._origin = np.array([_row * self.ENV_SPACING, _col * self.ENV_SPACING, 0.0])
 
         # Add a shared ground plane once (env 0 only); camera is set later
         # after all envs are loaded so we know the total span
         if self._idx == 0:
-            GroundPlane(
-                prim_path="/World/GroundPlane",
-                z_position=0,
-                color=np.array([0.12, 0.12, 0.15]),  # dark charcoal – contrasts with robot
-            )
+            # Use the Isaac Sim default grid environment (white grid pattern)
+            grid_env_usd = assets_root + "/Isaac/Environments/Grid/default_environment.usd"
+            add_reference_to_stage(usd_path=grid_env_usd, prim_path="/World/GridEnvironment")
 
         # Step 1: add USD reference onto the stage
         franka_usd = assets_root + self.FRANKA_USD
@@ -138,16 +141,27 @@ class PickPlaceEnv(gym.Env):
     # Gymnasium API
     # ------------------------------------------------------------------
 
+    def _first_reset(self):
+        """One-time physics initialisation called on the very first reset."""
+        self.world.reset()
+        self.world.play()
+        self.franka.initialize()
+
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self.step_count = 0
 
-        self.world.reset()
+        # On the very first reset we need to start physics; afterwards we
+        # just teleport the robot and block back – no stage rebuild needed.
+        if not getattr(self, '_physics_started', False):
+            self._first_reset()
+            self._physics_started = True
 
         # Neutral arm pose (joints 0-6) + open gripper (joints 7-8)
         neutral_pose = np.array([0.0, 0.5, 0.0, -1.5, 0.0, 1.5, 0.785,
                                  self.GRIPPER_MAX, self.GRIPPER_MAX])
         self.franka.set_joint_positions(neutral_pose)
+        self.franka.set_joint_velocities(np.zeros(9))
 
         # Reset block to initial pose (relative to this env's origin)
         self.target_block.set_world_pose(position=self._origin + np.array([0.5, 0.0, 0.035]))
@@ -166,6 +180,16 @@ class PickPlaceEnv(gym.Env):
 
         # --- Arm + gripper control ---
         current_q = self.franka.get_joint_positions()
+        # Guard: physics view may not be ready on the very first step after
+        # reset in some edge cases – pump extra sim steps until it is.
+        if current_q is None:
+            for _ in range(20):
+                self.world.step(render=False)
+            current_q = self.franka.get_joint_positions()
+        if current_q is None:
+            # Still not ready; skip this action and signal truncation so
+            # the training loop triggers a fresh reset.
+            return np.zeros(34, dtype=np.float32), 0.0, False, True, {}
         target_q = current_q[:7] + action[0:7] * self.max_action_step
         target_q = np.clip(target_q, -self.JOINT_LIMITS, self.JOINT_LIMITS)
         target_q[5] = -target_q[3]  # keep wrist parallel to gripper
@@ -203,7 +227,7 @@ class PickPlaceEnv(gym.Env):
         return np.array(pos, dtype=np.float32)
 
     def _get_obs(self) -> np.ndarray:
-        obs = np.zeros(31, dtype=np.float32)
+        obs = np.zeros(34, dtype=np.float32)
 
         all_q = self.franka.get_joint_positions()
         all_v = self.franka.get_joint_velocities()
@@ -217,25 +241,50 @@ class PickPlaceEnv(gym.Env):
         obs[17:20] = block_pos
         obs[20:23] = block_vel
 
+        # Relative vector EE → block (3D compass for the policy)
+        obs[31:34] = block_pos - obs[14:17]
+
         return obs
 
     def _compute_reward(self, obs: np.ndarray) -> float:
-        reward = -0.001  # time penalty
+        """
+        Curriculum reward – Phase 1: reach & touch the block.
 
+        Reward shaping:
+          - Dense reaching reward: -dist  so the gradient stays linear at all
+            distances (avoids saturation of the 1/(1+d) formulation).
+          - Reaching bonus:        +2  when EE is within 0.12 m (coarse zone).
+          - Touch bonus:           +5  when EE is within 0.05 m of the block
+            centre (fingers must bracket it).
+          - Lift bonus:            +20 when the block rises above 0.10 m.
+          - Height shaping:        +5*(block_z - 0.035) once lifted, to reward
+            lifting higher.
+          - Time penalty:          -0.01 per step to discourage idling (scaled
+            up from 0.001 so it meaningfully competes with the reach reward).
+        """
         ee_pos    = obs[14:17]
         block_pos = obs[17:20]
 
-        horiz_dist  = float(np.linalg.norm(ee_pos[:2] - block_pos[:2]))
-        vert_dist   = float(ee_pos[2] - block_pos[2])
         ee_to_block = float(np.linalg.norm(ee_pos - block_pos))
 
-        if horiz_dist < 0.15:
-            reward += 1.0
-        if horiz_dist < 0.08 and abs(vert_dist - 0.05) < 0.03:
+        # Linear reaching reward — constant gradient everywhere
+        reward = -ee_to_block
+
+        # Coarse approach bonus
+        if ee_to_block < 0.12:
             reward += 2.0
-        if ee_to_block < 0.08:
+
+        # Fine touch bonus (fingers close to block centre)
+        if ee_to_block < 0.05:
             reward += 5.0
-        if block_pos[2] > 0.10:  # lifted off table
-            reward += 10.0
+
+        # Lift bonus + height shaping
+        block_height = float(block_pos[2])
+        if block_height > 0.10:
+            reward += 20.0
+            reward += 5.0 * (block_height - 0.035)
+
+        # Time penalty
+        reward -= 0.01
 
         return reward

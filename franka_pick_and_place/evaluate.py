@@ -56,11 +56,12 @@ print(f"  Model    : {model_path}.zip")
 print(f"  Episodes : {num_episodes}")
 print()
 
-model = PPO.load(model_path)
+model = PPO.load(model_path, device="cpu")
 results = []
 
+env = PickPlaceEnv(max_episode_steps=config.MAX_EPISODE_STEPS)
+
 for ep in range(num_episodes):
-    env = PickPlaceEnv(max_episode_steps=config.MAX_EPISODE_STEPS)
     obs, _ = env.reset()
 
     ep_reward = 0.0
@@ -86,7 +87,6 @@ for ep in range(num_episodes):
             break
 
     ep_time = time.time() - t0
-    env.close()
 
     result = {
         "episode":       ep + 1,
@@ -106,6 +106,8 @@ for ep in range(num_episodes):
         f"touch={touch_icon}  lift={lift_icon}  "
         f"steps={env.step_count}"
     )
+
+env.close()
 
 # ── 6. Summary ────────────────────────────────────────────────────────────────
 n_touch = sum(r["touched"] for r in results)

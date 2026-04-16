@@ -1,0 +1,14 @@
+# Python cache artifacts
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# VS Code local workspace data
+.vscode/
+
+# Training/evaluation outputs
+logs/
+franka_pick_and_place/logs/
+
+# RL checkpoint/model artifacts
+franka_pick_and_place/model/*.zip

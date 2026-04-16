@@ -39,12 +39,13 @@ MAX_EPISODE_STEPS = 300            # timesteps per episode before truncation
 
 PPO = dict(
     learning_rate=3e-4,
-    n_steps=1024,
-    batch_size=64,
-    n_epochs=20,
+    n_steps=2048,           # longer rollouts → better advantage estimates
+    batch_size=256,         # larger mini-batches stabilise training
+    n_epochs=10,            # fewer epochs per rollout avoids overfitting
     gamma=0.99,
     gae_lambda=0.95,
     clip_range=0.2,
+    ent_coef=0.01,          # small entropy bonus keeps exploration alive
     policy_kwargs={"net_arch": [256, 256]},
 )
 
@@ -52,7 +53,7 @@ PPO = dict(
 # Training
 # ---------------------------------------------------------------------------
 
-TOTAL_TIMESTEPS = 100_000
+TOTAL_TIMESTEPS = 1_000_000
 N_ENVS = 1                         # parallel Isaac Sim worlds – scale freely (e.g. 100, 1000)
 CHECKPOINT_FREQ = 10_000           # save a checkpoint every N timesteps
 LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
